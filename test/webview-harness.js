@@ -102,6 +102,18 @@ function load(opts) {
   sendBtn.attributes.class = 'sendButton_xyz';
   sendBtn.attributes.type = 'submit';
   sendBtn._onclick = function () { sendClicks++; };
+  // Model Claude's real send/stop control faithfully: it is the SAME element for both roles.
+  // While IDLE it is DISABLED when the input is empty (nothing to send) and ENABLED once
+  // there's text to send. While BUSY it acts as Stop and is ENABLED even over an empty input.
+  // So by default `disabled` tracks input emptiness (the idle/send behaviour), and a test can
+  // force the busy/Stop case by assigning `sendBtn.disabled = false` (an explicit override).
+  // This is the exact distinction sendButtonIsStop() keys on.
+  let _sendDisabledOverride = null;
+  Object.defineProperty(sendBtn, 'disabled', {
+    configurable: true,
+    get() { return _sendDisabledOverride !== null ? _sendDisabledOverride : (inputEl.textContent === ''); },
+    set(v) { _sendDisabledOverride = v; },
+  });
 
   const body = makeEl('body');
   function selMatch(sel, el, classRe) {

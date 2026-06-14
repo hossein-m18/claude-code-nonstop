@@ -115,5 +115,27 @@ test('the same limit phrases in FOOTER chrome (outside the transcript) do not ra
   assert.notStrictEqual(h.debug.state(), 'RATE_LIMITED');
 });
 
+console.log('\nwebview behaviour — busy/Stop detection (the INTERRUPTED + stranded-ping fix)');
+
+test('send button ENABLED while the input is empty reads as WORKING (tool running, no output growth)', () => {
+  // The bug: during a tool call the transcript does not grow, so isStreaming() is false and
+  // the old detector fell through to WAITING_CONTINUE → it pinged → clicked the live Stop
+  // button → "INTERRUPTED" + ping text stranded in the box. The send/stop control being
+  // enabled while the input is empty uniquely means Claude is busy.
+  const h = load({ transcriptText: 'running a tool...', withSendButton: true, input: true, inputText: '' });
+  h.sendBtn.disabled = false; // live = acting as Stop
+  assert.strictEqual(h.debug.state(), 'WORKING',
+    'an enabled send/stop button over an empty input must read as WORKING, not WAITING_CONTINUE');
+});
+
+test('send button DISABLED while the input is empty stays pingable (idle, waiting on us)', () => {
+  // When Claude has finished its turn the same button is disabled (nothing to send) — that is
+  // the genuine "waiting for us" state, and we must still ping it.
+  const h = load({ transcriptText: 'All done above.', withSendButton: true, input: true, inputText: '' });
+  h.sendBtn.disabled = true; // idle = nothing to send
+  assert.strictEqual(h.debug.state(), 'WAITING_CONTINUE',
+    'a disabled send button over an empty input is idle-waiting and must remain pingable');
+});
+
 console.log('\n' + (failed === 0 ? 'ALL PASS' : 'FAILURES') + `: ${passed} passed, ${failed} failed\n`);
 process.exit(failed === 0 ? 0 : 1);

@@ -1,5 +1,15 @@
 # Changelog
 
+## \[0.3.2] - 2026-06-14
+
+### Fixed
+
+* **A ping no longer interrupts Claude mid-tool, and no longer gets stranded in the input box.** These were two faces of one bug: Claude's send control and its Stop/interrupt control are the *same* button, and while Claude was running a tool the transcript doesn't grow - so the growth-based "is it streaming" check (a 2s window) went blind, no other busy signal fired (the real Stop button carries no `aria-label`), and `detectState` fell through to `WAITING_CONTINUE`. The ping then typed its text and clicked that button while it was acting as Stop: the turn showed `INTERRUPTED`, and because the click stopped instead of sending, the "continue..." text was left sitting in the box. There's now a reliable busy signal that doesn't depend on output growth - `sendButtonIsStop()`: the send control being *enabled while the input is empty* uniquely means it's the Stop button (you can't send an empty message), i.e. Claude is busy. That state now reads as `WORKING` (checked after popup detection so permission/decision popups aren't masked), `setInputAndSend` re-checks it right before sending to close the tick-to-send race, and the fragile synthetic-Enter fallback - which frequently got dropped by the contenteditable and was the other way a ping got stranded - was removed in favor of clearing the box for a clean retry.
+
+### Tests
+
+* The webview DOM harness now models Claude's send/stop control faithfully (disabled over an empty input while idle; enabled over an empty input while busy/Stop), and two behavioural tests cover the new busy detection.
+
 ## \[0.3.1] - 2026-06-09
 
 ### Changed

@@ -227,6 +227,23 @@
   function getInput() { return $(SIGNALS.input); }
   function inputText() { var el = getInput(); return el ? (el.textContent || '').trim() : ''; }
 
+  // True when Claude's send control is currently acting as the Stop/interrupt button —
+  // i.e. Claude is busy (generating OR running a tool). The send and stop controls are the
+  // SAME <button class="sendButton_…"> element: while idle with an EMPTY input it is
+  // DISABLED (nothing to send), but while Claude is working it is ENABLED so you can
+  // interrupt. So "enabled while the input is empty" uniquely identifies the Stop state.
+  // This is exactly the signal that text-growth streaming detection MISSES: during a tool
+  // call the transcript does not grow (isStreaming() is false), yet the button is live as
+  // Stop — and clicking it (as a ping does) interrupts the tool ("INTERRUPTED") and strands
+  // the ping text in the box. (Consistent with findSendButton's existing assumption that a
+  // disabled button means there's nothing to send.)
+  function sendButtonIsStop() {
+    var footer = $(SIGNALS.footer);
+    var btn = (footer && $(SIGNALS.sendButton, footer)) || $(SIGNALS.sendButton);
+    if (!btn || btn.disabled) return false;
+    return inputText() === '';
+  }
+
   // The DOM subtree the detectors scan. Prefer Claude's transcript container (excludes
   // the footer chrome whose usage meter would false-trip the rate-limit detectors, and a
   // smaller subtree is cheaper). Fall back to document.body if the selector ever breaks
@@ -409,6 +426,13 @@
     if (popup === 'PERMISSION') return 'WAITING_PERMISSION';
     if (popup === 'DECISION') return 'WAITING_DECISION';
 
+    // Layer 1.5: the send control is live as Stop → Claude is busy (generating, or — the
+    // case growth-detection misses — running a tool with no visible output). Placed AFTER
+    // popup detection so a permission/decision popup is still classified and not masked as
+    // WORKING. This is what stops a ping from clicking Stop mid-tool ("INTERRUPTED") and
+    // stranding the ping text in the input.
+    if (sendButtonIsStop()) return 'WORKING';
+
     // Layer 2: observed postMessage state (fresh only).
     if (observedState && (Date.now() - observedStateAt) < 5000) {
       if (observedState === 'running') return 'WORKING';
@@ -545,6 +569,11 @@
     // Re-check RIGHT before we clear — closes the time-of-check/time-of-use race where
     // the user starts typing between maybePing()'s guard and this wipe.
     if (inputIsForeign()) { log('abort send: user draft in input'); return false; }
+    // Never type+click while the send control is acting as Stop — that interrupts Claude's
+    // in-flight tool/turn and leaves the ping text stranded in the box. Re-checked here (not
+    // only in tick) to close the race where Claude starts working between tick()'s decision
+    // and this send. Safe to read emptiness now: we haven't typed yet.
+    if (sendButtonIsStop()) { log('abort send: Claude busy (send button is Stop)'); return false; }
     weAreTyping = true;
     try {
       input.focus();
@@ -561,14 +590,22 @@
       }
       lastInsertedText = text; // remember it's ours, so a stuck copy isn't read as a user draft
       lsSet(LS.lastPing, text); // persist it too, so a reload still recognises our own stuck ping
-      // Submit: prefer a send button, else Enter.
+      // Submit via the real send button. We deliberately do NOT fall back to a synthetic
+      // Enter key: untrusted KeyboardEvents are frequently dropped by Claude's contenteditable,
+      // which is what left the ping text sitting visibly in the input box. If there's no
+      // clickable send button (generation just resumed and it flipped to Stop, or the selector
+      // broke), clear what we typed and bail so nothing is stranded — a later tick retries
+      // from a clean, idle state.
       var sendBtn = findSendButton();
       if (sendBtn) {
         sendBtn.click();
-      } else {
-        input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+        return true;
       }
-      return true;
+      try { document.execCommand('selectAll', false, null); document.execCommand('delete', false, null); } catch (e) {}
+      lastInsertedText = '';
+      lsSet(LS.lastPing, '');
+      log('send aborted: no clickable send button (input cleared for a clean retry)');
+      return false;
     } finally {
       // Release the typing flag shortly after, so user-activity detection ignores us.
       setTimeout(function () { weAreTyping = false; }, 250);
