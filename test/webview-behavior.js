@@ -230,5 +230,47 @@ test('a REAL "session limit" notice still reads as rate-limited (the guard did n
   assert.strictEqual(h.debug.state(), 'RATE_LIMITED', 'and still drive RATE_LIMITED');
 });
 
+console.log('\nwebview behaviour — per-conversation shift state (independent windows)');
+
+function sessionMsg(id, title) {
+  return {
+    type: 'from-extension',
+    message: { type: 'request', request: { type: 'session_states_update', activeSessionId: id, sessions: [{ sessionId: id, state: 'idle', title: title }] } },
+  };
+}
+
+test('shift state is namespaced per conversation — switching sessions shows that session\'s own ON/OFF', () => {
+  const h = load({ input: true });
+  h.fireMessage(sessionMsg('A', 'Chat A'));
+  h.ls.setItem('nonstop-s-A-enabled', 'true'); // A is ON
+  assert.strictEqual(h.debug.status().enabled, true, 'session A reads its own enabled key');
+  h.fireMessage(sessionMsg('B', 'Chat B'));     // switch to a different conversation
+  assert.strictEqual(h.debug.status().enabled, false, 'session B is independent (its own key, OFF)');
+  h.fireMessage(sessionMsg('A', 'Chat A'));     // back to A
+  assert.strictEqual(h.debug.status().enabled, true, 'session A still ON — never shared with B');
+});
+
+test('a shift toggled on BEFORE the sessionId is known migrates to the session on first learn', () => {
+  const h = load({ input: true });
+  // Toggled on while the id was still unknown → lands on the bare fallback keys.
+  h.ls.setItem('nonstop-enabled', 'true');
+  h.ls.setItem('nonstop-session-start', String(Date.now()));
+  h.ls.setItem('nonstop-ping-count', '2');
+  h.fireMessage(sessionMsg('A', 'Chat A')); // first id learned → migrate
+  assert.strictEqual(h.debug.status().enabled, true, 'the shift survives into the session namespace');
+  assert.strictEqual(h.ls.getItem('nonstop-s-A-enabled'), 'true', 'enabled moved under the session key');
+  assert.strictEqual(h.ls.getItem('nonstop-s-A-ping-count'), '2', 'all shift keys moved, not just enabled');
+  assert.strictEqual(h.ls.getItem('nonstop-enabled'), null, 'the bare fallback key is cleared after migration');
+});
+
+test('switching conversation (known→known) does NOT migrate state across conversations', () => {
+  const h = load({ input: true });
+  h.fireMessage(sessionMsg('A', 'Chat A'));
+  h.ls.setItem('nonstop-s-A-enabled', 'true'); // A is ON
+  h.fireMessage(sessionMsg('B', 'Chat B'));     // switch — must NOT carry A's ON into B
+  assert.strictEqual(h.ls.getItem('nonstop-s-B-enabled'), null, 'B did not inherit A\'s state');
+  assert.strictEqual(h.ls.getItem('nonstop-s-A-enabled'), 'true', 'A keeps its own state');
+});
+
 console.log('\n' + (failed === 0 ? 'ALL PASS' : 'FAILURES') + `: ${passed} passed, ${failed} failed\n`);
 process.exit(failed === 0 ? 0 : 1);

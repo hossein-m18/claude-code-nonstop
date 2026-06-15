@@ -1,5 +1,11 @@
 # Changelog
 
+## \[0.4.4] - 2026-06-15
+
+### Fixed
+
+* **Each VS Code window now runs its own independent shift.** The Claude webview's `localStorage` is shared across all windows of one VS Code install, so the single global shift state made every window move in lockstep - turning Nonstop on in one window lit the button in all of them, and turning it off in one stopped them all. The shift state (enabled, owner lease, ping count, sleep, etc.) is now namespaced per conversation (`nonstop-s-<sessionId>-…`), so windows on different conversations are fully independent: toggling one never touches the others, and each button reflects only its own conversation. The conversation id comes from the host-message sniffer (now also bootstrapped from any message carrying a `session_id`, so the namespace is known quickly); a shift toggled on before the id is known migrates onto the conversation once it's learned, so the early toggle isn't lost. Settings and the diagnostic log stay global. Switching conversations in a window shows that conversation's own on/off (a different conversation starts off).
+
 ## \[0.4.3] - 2026-06-15
 
 ### Fixed

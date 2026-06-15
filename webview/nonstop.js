@@ -74,7 +74,15 @@
   }
 
   // ── localStorage state (survives reload; source of truth at runtime) ─────────
-  var LS = {
+  // The Claude webview's localStorage is SHARED across all VS Code windows of one install,
+  // so a single global shift state made every window's toggle move in lockstep. To keep
+  // windows independent we NAMESPACE the shift-state keys by the active conversation
+  // (sessionId, learned by the host-message sniffer below): each conversation gets its own
+  // enabled/owner/pingCount/etc. Settings overrides (nonstop-ov-*) and the diagnostic log
+  // (nonstop-log) stay global on purpose. Until the sessionId is known we use the bare keys
+  // and migrate once on first learn (see learnSessionId), so a toggle made before the id
+  // arrived isn't stranded.
+  var LS_BASE = {
     enabled: 'nonstop-enabled',
     sleepUntil: 'nonstop-sleep-until',
     sessionStart: 'nonstop-session-start',
@@ -88,10 +96,33 @@
     servedRl: 'nonstop-served-rl',   // signature of a limit we've ALREADY waited out (don't re-sleep it)
     lastPing: 'nonstop-last-ping',   // the exact text we last typed (survives reload — see inputIsForeign)
   };
+  // Insert the conversation id into a base key: nonstop-enabled -> nonstop-s-<sid>-enabled.
+  function nsKeyFor(base, sid) {
+    return sid ? base.replace(/^nonstop-/, 'nonstop-s-' + sid + '-') : base;
+  }
+  // LS.<name> resolves to the CURRENT conversation's namespaced key at access time, so every
+  // existing lsGet(LS.x) / lsSet(LS.x) call site stays unchanged and just becomes per-session.
+  var LS = {};
+  Object.keys(LS_BASE).forEach(function (n) {
+    Object.defineProperty(LS, n, { enumerable: true, get: function () { return nsKeyFor(LS_BASE[n], sessionCtx.id); } });
+  });
   function lsGet(k, d) { try { var v = localStorage.getItem(k); return v === null ? d : v; } catch (e) { return d; } }
   function lsSet(k, v) { try { localStorage.setItem(k, String(v)); } catch (e) {} }
   function lsNum(k, d) { var n = parseInt(lsGet(k, ''), 10); return isNaN(n) ? d : n; }
   function isEnabled() { return lsGet(LS.enabled, 'false') === 'true'; }
+
+  // Move an in-progress shift's state from one conversation namespace to another. Used once,
+  // when the real sessionId is learned after a shift was already toggled on under the bare
+  // (sessionId-unknown) fallback — so that early toggle isn't stranded under a dead key.
+  function migrateShiftState(fromSid, toSid) {
+    if (fromSid === toSid) return;
+    Object.keys(LS_BASE).forEach(function (n) {
+      var fromKey = nsKeyFor(LS_BASE[n], fromSid);
+      var toKey = nsKeyFor(LS_BASE[n], toSid);
+      var v = lsGet(fromKey, null);
+      if (v !== null) { lsSet(toKey, v); try { localStorage.removeItem(fromKey); } catch (e) {} }
+    });
+  }
 
   // ── Diagnostic log (lean, always-on ring buffer in localStorage) ─────────────
   // The point: when an unattended shift misbehaves you can pull the relevant history
@@ -317,14 +348,32 @@
   // listener above must never do — but it only extracts identity (id/title/project) and
   // NEVER feeds state detection, so it can't be abused to forge a ping-suppressing/forcing
   // state. Best-effort: if the shape changes we simply keep blank labels.
+  // Adopt a learned conversation id as the current shift namespace. On the FIRST transition
+  // from unknown→known, migrate any shift toggled on under the bare fallback keys so it isn't
+  // stranded. On a real conversation SWITCH (known→known) we do NOT migrate — the shift
+  // belongs to the conversation, so the switched-to conversation shows its own state.
+  function learnSessionId(sid) {
+    sid = String(sid == null ? '' : sid).slice(0, 40);
+    if (!sid || sid === sessionCtx.id) return false;
+    var prev = sessionCtx.id;
+    sessionCtx.id = sid;
+    if (prev === '' && lsGet('nonstop-enabled', 'false') === 'true') migrateShiftState('', sid);
+    updateButton(); // reflect this conversation's own ON/OFF immediately (it may differ)
+    return true;
+  }
+
   window.addEventListener('message', function (ev) {
     var d = ev && ev.data;
     if (!d || typeof d !== 'object') return;
     var m = (d.type === 'from-extension' && d.message && typeof d.message === 'object') ? d.message : d;
     var req = (m.request && typeof m.request === 'object') ? m.request : null;
+    var inner = (m.message && typeof m.message === 'object') ? m.message : null;
     var changed = false;
 
-    // Conversation: pick the ACTIVE session out of a session_states_update.
+    // Conversation: prefer the ACTIVE session out of a session_states_update (it also carries
+    // the title). Otherwise bootstrap the id from ANY message that carries a session_id
+    // (io_message / system-init / hooks all do), so the per-conversation namespace is known
+    // ASAP — not only once a title-bearing update arrives.
     if (req && req.type === 'session_states_update' && Array.isArray(req.sessions)) {
       var activeId = req.activeSessionId || '';
       var active = null;
@@ -333,18 +382,20 @@
       }
       if (!active && req.sessions.length === 1) active = req.sessions[0]; // single session → unambiguous
       if (active) {
-        if (active.sessionId && String(active.sessionId) !== sessionCtx.id) { sessionCtx.id = String(active.sessionId).slice(0, 40); changed = true; }
+        if (learnSessionId(active.sessionId || '')) changed = true;
         // Collapse whitespace/newlines so a multi-line title (e.g. a conversation auto-titled
         // from pasted text) stays on one clean log line.
-        var t = String(active.title).replace(/\s+/g, ' ').trim().slice(0, 80);
+        var t = String(active.title == null ? '' : active.title).replace(/\s+/g, ' ').trim().slice(0, 80);
         if (t && t !== sessionCtx.title) { sessionCtx.title = t; changed = true; }
       }
+    } else {
+      var anySid = (inner && inner.session_id) || m.session_id || m.sessionId ||
+                   (req && (req.session_id || req.sessionId)) || '';
+      if (anySid && learnSessionId(anySid)) changed = true;
     }
 
     // Project: the working directory arrives in a couple of shapes — take whichever is present.
-    var cwd = (req && req.state && req.state.defaultCwd) ||
-              (m.message && typeof m.message === 'object' && m.message.cwd) ||
-              (req && req.cwd) || '';
+    var cwd = (req && req.state && req.state.defaultCwd) || (inner && inner.cwd) || (req && req.cwd) || '';
     var proj = projectFromCwd(cwd);
     if (proj && proj !== sessionCtx.project) { sessionCtx.project = proj; changed = true; }
 
