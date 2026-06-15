@@ -93,6 +93,121 @@
   function lsNum(k, d) { var n = parseInt(lsGet(k, ''), 10); return isNaN(n) ? d : n; }
   function isEnabled() { return lsGet(LS.enabled, 'false') === 'true'; }
 
+  // ── Diagnostic log (lean, always-on ring buffer in localStorage) ─────────────
+  // The point: when an unattended shift misbehaves you can pull the relevant history
+  // WITHOUT having had DevTools open — the same recoverability idea as rlCapture, made
+  // general. Read it back via __nonstopDebug.dumpLog() or the "Copy log" button in the
+  // settings popup. Every line is tagged with the conversation (sessionId + title) and the
+  // project, sniffed from Claude's own host messages — see the message listener below — so
+  // that a multi-window / multi-project setup stays
+  // disambiguable. Capped by both count and bytes so it never crowds out Claude's own
+  // localStorage. Only discrete lifecycle events are logged (not per-tick), so it stays
+  // small even over a long overnight shift.
+  var LOG_KEY = 'nonstop-log';
+  var LOG_MAX = 300;          // keep at most the last N entries
+  var LOG_MAX_BYTES = 64000;  // and never let the serialized log exceed this
+
+  // Conversation/project identity, learned at runtime by the sniffer below. Best-effort:
+  // if the host message shape changes we just get blank labels (still timestamped events).
+  var sessionCtx = { id: '', title: '', project: '' };
+
+  function logReadRaw() {
+    try { var a = JSON.parse(lsGet(LOG_KEY, '[]')); return Array.isArray(a) ? a : []; } catch (e) { return []; }
+  }
+  function nslog(event, extra) {
+    try {
+      var entry = { t: new Date().toISOString(), e: event };
+      if (sessionCtx.id) entry.s = sessionCtx.id;
+      if (sessionCtx.title) entry.c = sessionCtx.title;
+      if (sessionCtx.project) entry.p = sessionCtx.project;
+      if (extra) for (var k in extra) {
+        if (extra[k] !== undefined && extra[k] !== null && extra[k] !== '') entry[k] = extra[k];
+      }
+      var arr = logReadRaw();
+      arr.push(entry);
+      if (arr.length > LOG_MAX) arr = arr.slice(arr.length - LOG_MAX);
+      var str = JSON.stringify(arr);
+      while (str.length > LOG_MAX_BYTES && arr.length > 1) {
+        arr = arr.slice(Math.ceil(arr.length / 4)); // drop the oldest quarter and retry
+        str = JSON.stringify(arr);
+      }
+      lsSet(LOG_KEY, str);
+    } catch (e) {}
+    log(event, extra || ''); // mirror to console too when debug is on
+  }
+  // Render the buffer as plain text. By default only the CURRENT conversation (the
+  // "relevant log"); pass true for every conversation seen in this webview.
+  function formatLog(allSessions) {
+    var arr = logReadRaw();
+    var lines = [];
+    for (var i = 0; i < arr.length; i++) {
+      var x = arr[i];
+      if (!allSessions && sessionCtx.id && x.s && x.s !== sessionCtx.id) continue;
+      var parts = [x.t, '[' + (x.e || '?') + ']'];
+      if (x.p) parts.push('proj=' + x.p);
+      if (x.c) parts.push('conv="' + x.c + '"');
+      if (x.s) parts.push('(' + x.s + ')');
+      for (var k in x) {
+        if (k === 't' || k === 'e' || k === 's' || k === 'c' || k === 'p') continue;
+        parts.push(k + '=' + x[k]);
+      }
+      lines.push(parts.join(' '));
+    }
+    return lines.join('\n') || '(log empty)';
+  }
+  // A self-contained report for sharing: identity + current status + the full buffer.
+  function buildLogReport() {
+    var status = '(unavailable)';
+    try { status = JSON.stringify(window.__nonstopDebug.status()); } catch (e) {}
+    var header = [
+      'Nonstop diagnostic log' + (CFG.version ? ' (v' + CFG.version + ')' : ''),
+      'exported: ' + new Date().toISOString(),
+      'conversation: ' + (sessionCtx.title || '(unknown)') + (sessionCtx.id ? ' [' + sessionCtx.id + ']' : ''),
+      'project: ' + (sessionCtx.project || '(unknown)'),
+      'status: ' + status,
+      '',
+    ].join('\n');
+    return header + formatLog(true); // export everything; lines are labeled per conversation
+  }
+
+  // Reduce a cwd/path string to its last segment (the project folder name). The host knows
+  // the folder; we can't seed it from the extension because the injected block is shared
+  // across windows (see injector.js), so we read it from Claude's own host messages instead.
+  function projectFromCwd(cwd) {
+    if (!cwd || typeof cwd !== 'string') return '';
+    var seg = cwd.replace(/[\\/]+$/, '').split(/[\\/]/).pop();
+    return (seg || cwd).slice(0, 60);
+  }
+
+  // Copy text to the clipboard from inside the webview. Prefer the async Clipboard API;
+  // fall back to a hidden textarea + execCommand('copy') (works inside a user click).
+  function fallbackCopy(text) {
+    try {
+      var ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0;pointer-events:none;';
+      document.body.appendChild(ta);
+      ta.focus(); ta.select();
+      var ok = document.execCommand('copy');
+      ta.remove();
+      return ok;
+    } catch (e) { return false; }
+  }
+  function copyToClipboard(text) {
+    return new Promise(function (resolve) {
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(
+            function () { resolve(true); },
+            function () { resolve(fallbackCopy(text)); }
+          );
+          return;
+        }
+      } catch (e) {}
+      resolve(fallbackCopy(text));
+    });
+  }
+
   // Unique id for this webview instance (ownership for multi-panel; SPEC §4.7).
   var INSTANCE_ID = 'ns-' + Math.random().toString(36).slice(2) + '-' + Date.now();
   // Ownership is a heartbeat lease: the active panel renews LS.ownerBeat every tick.
@@ -191,6 +306,49 @@
       observedStateAt = Date.now();
       log('observed state via message:', st);
     }
+  });
+
+  // Sniff Claude's own host→webview messages PURELY to label the diagnostic log with the
+  // conversation and project. Verified live (2026-06-15, Claude 2.1.177): the host wraps its
+  // traffic as { type:'from-extension', message:{…} }; a `session_states_update` request
+  // carries the session list + the active id (each session has {sessionId, state, title}),
+  // and the cwd shows up as both `update_state`'s state.defaultCwd and a system/init `cwd`.
+  // This deliberately reads FOREIGN (non-namespaced) messages, which the observedState
+  // listener above must never do — but it only extracts identity (id/title/project) and
+  // NEVER feeds state detection, so it can't be abused to forge a ping-suppressing/forcing
+  // state. Best-effort: if the shape changes we simply keep blank labels.
+  window.addEventListener('message', function (ev) {
+    var d = ev && ev.data;
+    if (!d || typeof d !== 'object') return;
+    var m = (d.type === 'from-extension' && d.message && typeof d.message === 'object') ? d.message : d;
+    var req = (m.request && typeof m.request === 'object') ? m.request : null;
+    var changed = false;
+
+    // Conversation: pick the ACTIVE session out of a session_states_update.
+    if (req && req.type === 'session_states_update' && Array.isArray(req.sessions)) {
+      var activeId = req.activeSessionId || '';
+      var active = null;
+      for (var i = 0; i < req.sessions.length; i++) {
+        if (req.sessions[i] && req.sessions[i].sessionId === activeId) { active = req.sessions[i]; break; }
+      }
+      if (!active && req.sessions.length === 1) active = req.sessions[0]; // single session → unambiguous
+      if (active) {
+        if (active.sessionId && String(active.sessionId) !== sessionCtx.id) { sessionCtx.id = String(active.sessionId).slice(0, 40); changed = true; }
+        // Collapse whitespace/newlines so a multi-line title (e.g. a conversation auto-titled
+        // from pasted text) stays on one clean log line.
+        var t = String(active.title).replace(/\s+/g, ' ').trim().slice(0, 80);
+        if (t && t !== sessionCtx.title) { sessionCtx.title = t; changed = true; }
+      }
+    }
+
+    // Project: the working directory arrives in a couple of shapes — take whichever is present.
+    var cwd = (req && req.state && req.state.defaultCwd) ||
+              (m.message && typeof m.message === 'object' && m.message.cwd) ||
+              (req && req.cwd) || '';
+    var proj = projectFromCwd(cwd);
+    if (proj && proj !== sessionCtx.project) { sessionCtx.project = proj; changed = true; }
+
+    if (changed) nslog('session'); // breadcrumb: records when/what context was learned
   });
 
   function $(sel, root) { try { return (root || document).querySelector(sel); } catch (e) { return null; } }
@@ -363,7 +521,12 @@
   // 10:10pm" or "429" in ordinary chat no longer trips it. (A transcript that literally
   // discusses "session limit" can still match — the only airtight fix is anchoring on the
   // notice DOM element, which needs a verified selector; tracked as future work.)
-  var LOOKS_LIMITED_RE = /(?:session|usage|rate|hour)[\s-]*limit|limit\s*(?:reached|will\s*reset|reset)|too many requests|approaching your usage/i;
+  // The qualifier→"limit" separator is [\s-]+ (one or more), NOT [\s-]* — so a glued
+  // identifier like "RateLimitError" (a yfinance/FRED exception that shows up verbatim in a
+  // data project's transcript) no longer reads as a usage limit. A real notice always has a
+  // space ("session limit", "rate limit", "5-hour limit"). Same reason "limit" must be
+  // followed by a space before "reached"/"reset" (not "LimitReached" in some code).
+  var LOOKS_LIMITED_RE = /(?:session|usage|rate|hour)[\s-]+limit|limit\s+(?:reached|will\s+reset|reset)|too many requests|approaching your usage/i;
   function looksRateLimited() {
     var text = panelText();
     return !!text && LOOKS_LIMITED_RE.test(text.slice(-4000));
@@ -498,7 +661,7 @@
 
     // mode === 'approve': click Yes once per popup.
     if (sig && sig === permissionHandledSig) return;
-    if (approvePermission()) { permissionHandledSig = sig; log('permission auto-approved'); }
+    if (approvePermission()) { permissionHandledSig = sig; nslog('permission', { action: 'approve' }); log('permission auto-approved'); }
   }
 
   // best-judgment: select the last option ("Other"), type the answer into the revealed
@@ -534,7 +697,7 @@
   function handleDecision() {
     if (liveCfg('onDecision') === 'best-judgment') {
       if (!decisionSeenAt) decisionSeenAt = Date.now();
-      if (answerDecisionBestJudgment()) { decisionSeenAt = 0; return; }
+      if (answerDecisionBestJudgment()) { decisionSeenAt = 0; nslog('decision', { action: 'answer' }); return; }
       // Couldn't complete the answer yet — give it a short window, then fall back to
       // stopping so we never spin silently on a popup we can't drive.
       if ((Date.now() - decisionSeenAt) < 6000) return;
@@ -563,53 +726,114 @@
     return t !== mine;
   }
 
+  // Claude's composer is a React-controlled contenteditable (verified live: not Lexical;
+  // the node carries React's own __reactProps$… handlers). Its onInput reads the element's
+  // textContent into React state, and the send button is gated on that state. execCommand
+  // inserts VISIBLE text but does NOT reach React's delegated onInput here (text appears yet
+  // the button stays disabled), so we push the text into React state by invoking the
+  // component's own onInput prop directly. The prop's key suffix is hashed per render, so
+  // find it dynamically and degrade to a no-op if the shape ever changes (the DOM-only
+  // harness has no React props, and still sends because its button tracks input emptiness).
+  function reactPropsOf(el) {
+    if (!el) return null;
+    var keys;
+    try { keys = Object.keys(el); } catch (e) { return null; }
+    for (var i = 0; i < keys.length; i++) {
+      if (keys[i].indexOf('__reactProps') === 0) return el[keys[i]];
+    }
+    return null;
+  }
+  function notifyReactInput(el) {
+    var props = reactPropsOf(el);
+    if (props && typeof props.onInput === 'function') {
+      // onInput reads el.textContent itself (takes no real args), but pass a minimal event
+      // shape so a future build that touches the event object don't throw.
+      try { props.onInput({ target: el, currentTarget: el }); return true; } catch (e) {}
+    }
+    return false;
+  }
+
+  // A send is "in flight" from typing the text until the click that submits it. The click is
+  // DEFERRED: notifyReactInput's setState is out-of-band, so React flushes it (and enables the
+  // send button) on a later tick — the button isn't clickable synchronously. attemptSend
+  // retries the click on short timers until it is, then gives up cleanly.
+  var sendPending = false;
+  var sendStartedAt = 0;
+  var SEND_RETRY_MS = 100;
+  var SEND_MAX_TRIES = 8; // ~800ms total: long enough for a React flush, short enough to re-ping
+
+  // Record a confirmed ping (the send button was actually clicked). Centralised so the
+  // synchronous click (button already live) and the deferred retry click account identically.
+  function recordSentPing(text) {
+    lastSendAt = Date.now();
+    lastPingAt = Date.now();
+    if (text.indexOf(CFG.doneSentinel) !== -1) sentinelPings++;
+    lsSet(LS.pingCount, lsNum(LS.pingCount, 0) + 1);
+    lastPingSig = outputSignature(); // capture right after the send, for stall detection
+    nslog('ping', { n: lsNum(LS.pingCount, 0), retry: stallRetries || undefined });
+    log('pinged:', text.slice(0, 40));
+  }
+
+  // Click the send button if it's live; otherwise retry on short timers (the React state
+  // flush that enables it is async). On give-up, clear our typed text so nothing is stranded
+  // and a later tick retries from a clean state.
+  function attemptSend(text, tryNum) {
+    if (tryNum === 0) { sendPending = true; sendStartedAt = Date.now(); }
+    var btn = findSendButton();
+    if (btn) {
+      btn.click();
+      recordSentPing(text);
+      sendPending = false;
+      setTimeout(function () { weAreTyping = false; }, 250);
+      return;
+    }
+    if (tryNum < SEND_MAX_TRIES) {
+      setTimeout(function () { attemptSend(text, tryNum + 1); }, SEND_RETRY_MS);
+      return;
+    }
+    try { document.execCommand('selectAll', false, null); document.execCommand('delete', false, null); } catch (e) {}
+    notifyReactInput(getInput()); // keep React state in sync with the now-empty box
+    lastInsertedText = '';
+    lsSet(LS.lastPing, '');
+    sendPending = false;
+    weAreTyping = false;
+    log('send aborted: send button never became clickable');
+  }
+
   function setInputAndSend(text) {
     var input = getInput();
-    if (!input) { log('no input box found'); return false; }
+    if (!input) { log('no input box found'); return; }
     // Re-check RIGHT before we clear — closes the time-of-check/time-of-use race where
     // the user starts typing between maybePing()'s guard and this wipe.
-    if (inputIsForeign()) { log('abort send: user draft in input'); return false; }
+    if (inputIsForeign()) { log('abort send: user draft in input'); return; }
     // Never type+click while the send control is acting as Stop — that interrupts Claude's
     // in-flight tool/turn and leaves the ping text stranded in the box. Re-checked here (not
     // only in tick) to close the race where Claude starts working between tick()'s decision
     // and this send. Safe to read emptiness now: we haven't typed yet.
-    if (sendButtonIsStop()) { log('abort send: Claude busy (send button is Stop)'); return false; }
+    if (sendButtonIsStop()) { log('abort send: Claude busy (send button is Stop)'); return; }
     weAreTyping = true;
-    try {
-      input.focus();
-      // Clear any leftover (e.g. a previous failed send that became a newline, or our
-      // own stuck ping). Safe now: a foreign user draft was rejected just above.
-      try { document.execCommand('selectAll', false, null); document.execCommand('delete', false, null); } catch (e) {}
-      var ok = false;
-      try { ok = document.execCommand('insertText', false, text); } catch (e) { ok = false; }
-      if (!ok) {
-        // Fallback: synthetic InputEvent.
+    input.focus();
+    // Clear any leftover (e.g. a previous failed send that became a newline, or our own
+    // stuck ping). Safe now: a foreign user draft was rejected just above.
+    try { document.execCommand('selectAll', false, null); document.execCommand('delete', false, null); } catch (e) {}
+    var ok = false;
+    try { ok = document.execCommand('insertText', false, text); } catch (e) { ok = false; }
+    if (!ok) {
+      // Fallback: synthetic InputEvent.
+      try {
         input.dispatchEvent(new InputEvent('beforeinput', { inputType: 'insertText', data: text, bubbles: true, cancelable: true }));
         input.textContent = text;
         input.dispatchEvent(new InputEvent('input', { inputType: 'insertText', data: text, bubbles: true }));
-      }
-      lastInsertedText = text; // remember it's ours, so a stuck copy isn't read as a user draft
-      lsSet(LS.lastPing, text); // persist it too, so a reload still recognises our own stuck ping
-      // Submit via the real send button. We deliberately do NOT fall back to a synthetic
-      // Enter key: untrusted KeyboardEvents are frequently dropped by Claude's contenteditable,
-      // which is what left the ping text sitting visibly in the input box. If there's no
-      // clickable send button (generation just resumed and it flipped to Stop, or the selector
-      // broke), clear what we typed and bail so nothing is stranded — a later tick retries
-      // from a clean, idle state.
-      var sendBtn = findSendButton();
-      if (sendBtn) {
-        sendBtn.click();
-        return true;
-      }
-      try { document.execCommand('selectAll', false, null); document.execCommand('delete', false, null); } catch (e) {}
-      lastInsertedText = '';
-      lsSet(LS.lastPing, '');
-      log('send aborted: no clickable send button (input cleared for a clean retry)');
-      return false;
-    } finally {
-      // Release the typing flag shortly after, so user-activity detection ignores us.
-      setTimeout(function () { weAreTyping = false; }, 250);
+      } catch (e) {}
     }
+    lastInsertedText = text; // remember it's ours, so a stuck copy isn't read as a user draft
+    lsSet(LS.lastPing, text); // persist it too, so a reload still recognises our own stuck ping
+    // Push the text into React state so the send button enables, then submit. We deliberately
+    // do NOT fall back to a synthetic Enter key: untrusted KeyboardEvents are frequently
+    // dropped by the contenteditable, which is what used to leave the ping text in the box.
+    // The button enables asynchronously, so attemptSend defers/retries the click.
+    notifyReactInput(input);
+    attemptSend(text, 0);
   }
 
   function findSendButton() {
@@ -651,6 +875,7 @@
     // Reset in-memory ping/stall state for a fresh shift.
     stallCount = 0; stallRetries = 0; lastPingSig = null; lastPingAt = 0; lastSendAt = 0; lastGrowthAt = 0;
     baseSentinel = sentinelCount(); sentinelPings = 0;
+    nslog('start', { interval: Math.round(liveCfg('pingIntervalMs') / 1000) + 's' });
     log('shift started; owner', INSTANCE_ID);
     updateButton();
   }
@@ -661,6 +886,7 @@
     // block another panel from taking a fresh shift.
     if (isOwner()) { lsSet(LS.ownerId, ''); lsSet(LS.ownerBeat, 0); }
     lsSet(LS.lastStop, (reason || 'manual') + ' @ ' + new Date().toISOString());
+    nslog('stop', { reason: reason || 'manual', pings: lsNum(LS.pingCount, 0) });
     log('shift stopped:', reason || 'manual');
     updateButton();
   }
@@ -709,7 +935,15 @@
   // "Done" only if the sentinel appears MORE times than we injected — our own ping
   // text names the sentinel, so a naive substring match false-positives instantly.
   function sawDoneSentinel() {
-    return CFG.sentinelDoneDetection && sentinelCount() > (baseSentinel + sentinelPings);
+    if (!CFG.sentinelDoneDetection) return false;
+    // Never honor a completion sentinel we didn't solicit. Until we've actually pinged with
+    // the sentinel instruction (sentinelPings > 0), any NONSTOP_DONE already on screen is
+    // pre-existing — a prior shift's reply, a paste, or this very feature being discussed —
+    // not a response to us. Without this guard a fresh shift over such a transcript stopped
+    // dead at pings=0 (the baseSentinel taken at start can also under-count while the
+    // transcript is still lazy-loading, then "grow" into a false completion).
+    if (sentinelPings === 0) return false;
+    return sentinelCount() > (baseSentinel + sentinelPings);
   }
 
   // ── User activity detection (don't fight a returning user) ───────────────────
@@ -843,9 +1077,10 @@
         stallCount = 0;
         stallRetries = 0; // real progress → reset the backoff escalation
       }
-      if (maybePing(buildPingText())) {
-        lastPingSig = outputSignature();
-      }
+      // The send is now fire-and-confirm: setInputAndSend types the text and defers the click
+      // until React enables the button; the ping is accounted in recordSentPing on a confirmed
+      // send (which also sets lastPingSig). So just kick it off here — no synchronous return.
+      maybePing(buildPingText());
     }
   }
 
@@ -853,16 +1088,13 @@
     if (userRecentlyActive()) { log('paused: user active'); return false; }
     if (inQuietHours()) { log('paused: quiet hours'); return false; }
     if (inputIsForeign()) { log('paused: user draft in input'); return false; }
+    if (sendPending && (Date.now() - sendStartedAt) < 4000) return false; // a send is mid-flight
     if ((Date.now() - lastSendAt) < 3000) return false; // anti double-fire
 
-    if (setInputAndSend(text)) {
-      lastSendAt = Date.now();
-      lastPingAt = Date.now();
-      if (text.indexOf(CFG.doneSentinel) !== -1) sentinelPings++;
-      lsSet(LS.pingCount, lsNum(LS.pingCount, 0) + 1);
-      log('pinged:', text.slice(0, 40));
-      return true;
-    }
+    // setInputAndSend types the text and submits it (synchronously if the button is already
+    // live, else via a short deferred retry). The ping is counted in recordSentPing once the
+    // click actually lands — not here — so a never-clickable button never inflates the count.
+    setInputAndSend(text);
     return false;
   }
 
@@ -890,6 +1122,7 @@
     lsSet(LS.sleepUntil, until);
     // Remember which notice we're sleeping out, so on wake we don't re-sleep the same one.
     lsSet(LS.pendingRlSig, rateLimitSignature());
+    nslog('sleep', { until: new Date(until).toISOString(), captured: (rl && rl.captured) || undefined });
     log('rate limited — sleeping until', new Date(until).toISOString());
   }
 
@@ -1135,6 +1368,38 @@
     pop.appendChild(reset);
     pop.appendChild(resetMsg);
 
+    // Copy the diagnostic log to the clipboard — paste it into an email/issue when a shift
+    // misbehaves. No host↔webview channel in the MVP, so the log lives in localStorage and
+    // this is how it leaves the panel without opening DevTools.
+    var copyLog = document.createElement('button');
+    copyLog.type = 'button';
+    copyLog.textContent = 'Copy diagnostic log';
+    copyLog.title = 'Copy a shareable log (this panel: shift events, pings, sleeps, stops — tagged with the conversation) to the clipboard.';
+    copyLog.style.cssText = 'margin-top:6px;width:100%;cursor:pointer;background:var(--vscode-button-secondaryBackground,#3a3d41);' +
+      'color:var(--vscode-button-secondaryForeground,#ccc);border:none;border-radius:3px;padding:4px;';
+    var copyMsg = document.createElement('div');
+    copyMsg.setAttribute('role', 'status'); // announce the result to screen readers
+    copyMsg.style.cssText = 'text-align:center;font-size:11px;height:13px;margin-top:4px;' +
+      'color:var(--vscode-charts-green,#4ec9b0);opacity:0;transition:opacity .15s;';
+    copyLog.onclick = function () {
+      var text = buildLogReport();
+      copyToClipboard(text).then(function (ok) {
+        if (ok) {
+          copyMsg.style.color = 'var(--vscode-charts-green,#4ec9b0)';
+          copyMsg.textContent = '✓ Copied (' + logReadRaw().length + ' entries)';
+        } else {
+          // Clipboard blocked — still hand the log over via the console so it's never lost.
+          console.log('[Nonstop] diagnostic log:\n' + text);
+          copyMsg.style.color = 'var(--vscode-charts-yellow,#e3b341)';
+          copyMsg.textContent = '⚠ Copy blocked — logged to console';
+        }
+        copyMsg.style.opacity = '1';
+        setTimeout(function () { copyMsg.style.opacity = '0'; }, 2200);
+      });
+    };
+    pop.appendChild(copyLog);
+    pop.appendChild(copyMsg);
+
     // Brief "saved" cue on any field change (change bubbles, so one listener covers all
     // fields) — confirms the blur-to-save took effect without a per-field handler.
     pop.addEventListener('change', function (ev) {
@@ -1245,7 +1510,12 @@
       // when it's been detached (Claude re-rendered the footer) do we rebuild the toolbar
       // and re-dock.
       var existingBar = document.getElementById('orb-tools');
-      if (existingBar && existingBar.isConnected && btn0.parentNode === existingBar) return;
+      // Repaint to the LIVE shift state on every pass (cheap: getElementById + classList).
+      // The visual used to update only when THIS panel toggled/started/stopped, so when the
+      // shift state changed any other way (another panel, an auto-stop that didn't repaint)
+      // the ♾️ glow desynced from the real state — i.e. it lied. Self-healing here keeps the
+      // button honest against status().enabled. (Still cheap; runs on the 2.5s injectButton.)
+      if (existingBar && existingBar.isConnected && btn0.parentNode === existingBar) { updateButton(); return; }
       var bar0 = ensureToolbar();
       if (bar0 && btn0.parentNode !== bar0) bar0.appendChild(btn0);
       return;
@@ -1331,6 +1601,13 @@
     // Phase 3 helpers: read or clear the stashed real rate-limit notice.
     rateLimitCapture: function () { return lsGet(LS.rlCapture, '(none captured)'); },
     clearRateLimitCapture: function () { lsSet(LS.rlCapture, ''); return 'cleared'; },
+    // Diagnostic log: dumpLog() = this conversation only; dumpLog(true) = every
+    // conversation seen in this panel. report() = a shareable export (identity + status +
+    // full log) — the same text the "Copy log" button copies. clearLog() empties it.
+    dumpLog: function (allSessions) { return formatLog(!!allSessions); },
+    report: buildLogReport,
+    clearLog: function () { lsSet(LOG_KEY, '[]'); return 'cleared'; },
+    sessionContext: function () { return Object.assign({}, sessionCtx); },
     // Live shift status — the one-stop diagnostic ("why did it stop? is it sleeping?").
     status: function () {
       var s = lsNum(LS.sleepUntil, 0);

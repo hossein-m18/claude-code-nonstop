@@ -137,5 +137,98 @@ test('send button DISABLED while the input is empty stays pingable (idle, waitin
     'a disabled send button over an empty input is idle-waiting and must remain pingable');
 });
 
+console.log('\nwebview behaviour — host-message sniffer labels the diagnostic log (conversation + project)');
+
+test('a session_states_update labels the log with the ACTIVE session title + id', () => {
+  const h = load({ input: true });
+  h.fireMessage({
+    type: 'from-extension',
+    message: {
+      type: 'request',
+      request: {
+        type: 'session_states_update',
+        activeSessionId: 'sess-2',
+        sessions: [
+          { sessionId: 'sess-1', state: 'idle', title: 'Other chat' },
+          { sessionId: 'sess-2', state: 'running', title: 'תיקיית פרוייקט חדשה' },
+        ],
+      },
+    },
+  });
+  const ctx = h.debug.sessionContext();
+  assert.strictEqual(ctx.id, 'sess-2', 'must pick the active session id, not the first');
+  assert.strictEqual(ctx.title, 'תיקיית פרוייקט חדשה', 'must take the active session title');
+});
+
+test('the project name is the cwd last segment, from update_state.state.defaultCwd', () => {
+  const h = load({ input: true });
+  h.fireMessage({
+    type: 'from-extension',
+    message: { type: 'request', request: { type: 'update_state', state: { defaultCwd: 'c:\\Users\\orben\\OneDrive\\DEV\\Projects\\KeepIt' } } },
+  });
+  assert.strictEqual(h.debug.sessionContext().project, 'KeepIt', 'project = last path segment of defaultCwd');
+});
+
+test('the project name is also picked up from a system/init cwd', () => {
+  const h = load({ input: true });
+  h.fireMessage({
+    type: 'from-extension',
+    message: { type: 'io_message', message: { type: 'system', subtype: 'init', cwd: '/home/me/work/acme-api' } },
+  });
+  assert.strictEqual(h.debug.sessionContext().project, 'acme-api', 'project = last path segment of a unix cwd');
+});
+
+test('the sniffer NEVER feeds state detection (a forged running state cannot suppress pings)', () => {
+  // The session message carries state:"running", but the sniffer must only label the log —
+  // it must not influence detectState (that boundary is what keeps a forged message from
+  // suppressing or forcing pings). With an empty idle input, state stays pingable.
+  const h = load({ input: true, inputText: '', transcriptText: 'idle' });
+  h.fireMessage({
+    type: 'from-extension',
+    message: { type: 'request', request: { type: 'session_states_update', activeSessionId: 's', sessions: [{ sessionId: 's', state: 'running', title: 'x' }] } },
+  });
+  assert.strictEqual(h.debug.state(), 'WAITING_CONTINUE',
+    'a sniffed running state must not flip detectState to WORKING');
+});
+
+console.log('\nwebview behaviour — false-positive guards (sentinel + rate-limit lookalikes)');
+
+test('a leftover NONSTOP_DONE from a previous run does NOT stop a fresh shift at pings=0', () => {
+  // The reported case: a prior shift in the same conversation completed and left its
+  // NONSTOP_DONE in the transcript. A new shift must not read that as "done" before it has
+  // even pinged — until we inject the sentinel ourselves, any NONSTOP_DONE on screen is old.
+  const store = new Map();
+  store.set('nonstop-enabled', 'true');
+  store.set('nonstop-session-start', String(Date.now()));
+  const h = load({
+    store, input: true, withSendButton: true, inputText: '',
+    transcriptText: 'Earlier task finished. NONSTOP_DONE',
+    config: { sentinelDoneDetection: true },
+  });
+  const before = h.sendClicks();
+  h.pump();
+  assert.strictEqual(h.ls.getItem('nonstop-enabled'), 'true',
+    'must not stop on a pre-existing sentinel before we have pinged');
+  assert.ok(!/done-sentinel/.test(h.ls.getItem('nonstop-last-stop') || ''),
+    'last-stop must not be done-sentinel');
+  assert.ok(h.sendClicks() - before >= 1, 'it should ping, not declare done');
+});
+
+test('a "RateLimitError" in app output is NOT read as a usage limit', () => {
+  // A data project (yfinance/FRED) prints "RateLimitError" verbatim; the glued identifier
+  // must not trip the limit safety-net (which could sleep a shift for hours).
+  const h = load({ transcriptText: 'Traceback: adapters.yfinance raised RateLimitError fetching FRED macro data' });
+  assert.strictEqual(h.debug.status().looksRateLimited, false,
+    'a glued RateLimitError identifier must not trip looksRateLimited');
+  assert.notStrictEqual(h.debug.state(), 'RATE_LIMITED',
+    'and it must not drive state to RATE_LIMITED');
+});
+
+test('a REAL "session limit" notice still reads as rate-limited (the guard did not over-tighten)', () => {
+  const h = load({ transcriptText: "You've hit your session limit · resets 10:10pm (Asia/Jerusalem)" });
+  assert.strictEqual(h.debug.status().looksRateLimited, true, 'a real spaced notice must still match');
+  assert.strictEqual(h.debug.state(), 'RATE_LIMITED', 'and still drive RATE_LIMITED');
+});
+
 console.log('\n' + (failed === 0 ? 'ALL PASS' : 'FAILURES') + `: ${passed} passed, ${failed} failed\n`);
 process.exit(failed === 0 ? 0 : 1);

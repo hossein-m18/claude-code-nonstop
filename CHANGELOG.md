@@ -1,5 +1,39 @@
 # Changelog
 
+## \[0.4.3] - 2026-06-15
+
+### Fixed
+
+* **A leftover completion sentinel from a previous run no longer kills a fresh shift on sight.** If an earlier shift in the same conversation finished and left its `NONSTOP_DONE` in the transcript, starting a new shift would immediately stop with `done-sentinel` at `pings=0` - it read the old sentinel as a reply to a ping it never sent (and the baseline count taken at start can also under-count while the transcript is still lazy-loading, then "grow" into a false completion). Done-by-sentinel is now ignored until we've actually pinged with the sentinel instruction at least once this shift (`sentinelPings > 0`), so a pre-existing `NONSTOP_DONE` can't end a shift before it begins. A real completion (a sentinel that appears *after* our ping) still stops immediately.
+* **Application output that merely contains the word "RateLimitError" is no longer mistaken for a Claude usage limit.** The "looks rate-limited" safety net matched a qualifier glued straight onto "limit" (e.g. the `RateLimitError` exception that a yfinance/FRED data project prints verbatim), which risked putting a shift to sleep for hours over ordinary error text. It now requires a real separator between the qualifier and "limit" (`rate limit`, `session limit`, `5-hour limit` all still match; `RateLimitError` does not). The strict notice detector that actually triggers sleep was already anchored on the full `hit your … limit … resets …` structure and is unchanged.
+
+### Changed
+
+* Diagnostic-log conversation titles are collapsed to a single line (whitespace/newlines squashed), so a conversation auto-titled from pasted multi-line text stays readable in the log.
+
+## \[0.4.2] - 2026-06-15
+
+### Fixed
+
+* **The diagnostic log now labels each line with the real conversation and project** instead of `(unknown)`. The 0.4.0 sniffer looked for `sessionId`/`title` at the top level of incoming messages, but the host actually wraps its traffic as `{ type:'from-extension', message:{…} }`: the conversation comes from a `session_states_update` request (its `sessions[]` each carry `{sessionId, state, title}`, with `activeSessionId` naming the current one), and the working directory arrives as both `update_state`'s `state.defaultCwd` and a `system`/`init` `cwd`. The sniffer now reads those real shapes - picking the active session's title/id and the cwd's last path segment as the project - verified live against Claude 2.1.177. It still only extracts identity for the log and never feeds state detection, so the 0.3.0 security boundary holds (a forged `running` state can't suppress or force pings); there's a test for exactly that.
+
+## \[0.4.1] - 2026-06-15
+
+### Fixed
+
+* **Pings now actually send.** On the current Claude Code build the shift would run (`enabled`, `owner`, state `WAITING_CONTINUE`) but `pings` stayed at `0`: the ping typed its text into the box and then found the send button still `disabled`, so it cleared the text and bailed - every tick. Root cause, traced live: Claude's composer is a React-controlled `contenteditable` (not Lexical), and its send button is gated on React state that `onInput` populates by reading the element's `textContent`. `execCommand('insertText')` puts visible text in the box but does **not** reach React's delegated `onInput` in this webview, so React still thought the input was empty and kept the button disabled. The fix pushes the text into React state by invoking the component's own `onInput` prop directly (its prop key is hashed per render, so it's found dynamically). Because that `setState` is out-of-band it flushes a tick later, so the click is now deferred and retried on short timers (up to ~800ms) until the button enables, then accounted once - a button that never becomes clickable no longer inflates the ping count, and a stranded ping is still cleared for a clean retry. The DOM-only test harness (whose button tracks input emptiness, with no React) still passes unchanged.
+
+## \[0.4.0] - 2026-06-15
+
+### Added
+
+* **A lean, always-on diagnostic log you can pull after the fact.** When an unattended shift misbehaves you no longer need to have had DevTools open: a capped ring buffer in `localStorage` (last 300 entries / 64KB) records the discrete lifecycle events - `start`, `stop` (with reason), `ping` (with count), `sleep`/`wake`, and `permission`/`decision` actions - each tagged with the conversation and project. Read it back with `__nonstopDebug.dumpLog()` (current conversation) or `dumpLog(true)` (every conversation seen in the panel), get a shareable export with `__nonstopDebug.report()`, or use the new **"Copy diagnostic log"** button in the settings popup, which copies the whole report (identity + live status + log) to the clipboard - so you can paste the *relevant* log into an email or issue. `clearLog()` empties it.
+* **The log is labeled per conversation and project.** A best-effort sniffer reads Claude's own `update_session_state` host message (RECON §1) to learn the `sessionId`, conversation title, and a project name, so a multi-window / multi-project setup stays disambiguable in the log. This sniffer only extracts identity and never feeds state detection, so reading those (non-namespaced) messages can't be used to forge a ping-suppressing or ping-forcing state - the security boundary from 0.3.0 is preserved.
+
+### Fixed
+
+* **The ♾️ button no longer lies about the shift state.** Its glow was repainted only when *that panel* toggled/started/stopped - the 2.5s re-injector's fast path returned early without refreshing it - so when the shift state changed any other way (an auto-stop, or simply comparing one window's button to another's storage) the button could show ON while the shift was OFF, or vice versa. It now self-heals to the live state on every re-inject pass. (Storage is per-window, so each window still has its own independent shift; the reliable source of truth remains `__nonstopDebug.status().enabled`.)
+
 ## \[0.3.2] - 2026-06-14
 
 ### Fixed

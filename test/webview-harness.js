@@ -148,9 +148,10 @@ function load(opts) {
 
   const intervals = [];
   const timers = [];
+  const msgListeners = [];
   const windowStub = {
     __NONSTOP_CONFIG__: Object.assign({ debug: false }, opts.config || {}),
-    addEventListener() {},
+    addEventListener(type, fn) { if (type === 'message' && typeof fn === 'function') msgListeners.push(fn); },
     removeEventListener() {},
     innerWidth: 1200,
     innerHeight: 800,
@@ -205,6 +206,7 @@ function load(opts) {
     sendClicks: () => sendClicks,
     pump() { intervals.forEach(fn => { try { fn(); } catch (e) {} }); },
     fireTimers() { while (timers.length) { const t = timers.shift(); try { t(); } catch (e) {} } },
+    fireMessage(data) { msgListeners.forEach(fn => { try { fn({ data }); } catch (e) {} }); },
   };
 }
 
