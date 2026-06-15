@@ -1,5 +1,16 @@
 # Changelog
 
+## \[0.4.5] - 2026-06-15
+
+### Fixed
+
+* **An hour-only reset time ("resets 1pm") is now parsed, instead of sleeping 5 hours.** The session-limit notice often shows a whole-hour reset with no minutes ("resets 1pm (Asia/Jerusalem)"), but the reset-time patterns required `H:MM`, so the time was never captured and Nonstop fell back to its 5-hour default sleep - it stayed asleep for hours after the limit had already reset. Minutes are now optional in both the detection and the parser ("1pm" and "1:00pm" both work).
+* **A reset time that has already passed now resumes immediately instead of sleeping ~24h.** When the on-screen notice's reset time is in the recent past (the limit has already reset - e.g. you reopen to a stale notice), Nonstop no longer rolls it to "tomorrow" and sleeps a full day. It treats the time as already reset, marks the notice served, and resumes pinging. A genuinely upcoming reset that crosses midnight is still handled (an 8-hour grace cleanly separates "just passed" from "next occurrence").
+
+### Notes
+
+* Recovery for a window already stuck in the old 5-hour sleep: run `__nonstopDebug.simulateRateLimit(2)` in that panel's webview console - it clears the committed sleep and resumes within a couple of seconds.
+
 ## \[0.4.4] - 2026-06-15
 
 ### Fixed

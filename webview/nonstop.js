@@ -304,7 +304,7 @@
     // captures the reset time (m[1]) for parseResetTime; the others flag a limit and let
     // enterSleep() extract the time via resetTimeRegexes below.
     rateLimitRegexes: [
-      /hit your (?:session|usage|rate) limit[\s\S]{0,80}?resets?\s+(\d{1,2}:\d{2}\s*[ap]m\b(?:\s*\([^)]+\))?)/i,
+      /hit your (?:session|usage|rate) limit[\s\S]{0,80}?resets?\s+(\d{1,2}(?::\d{2})?\s*[ap]m\b(?:\s*\([^)]+\))?)/i,
       /\b\d+\s*-?\s*hour limit reached/i,
       /(?:hit|reached)[^\n]{0,30}\b(?:session|usage|rate) limit/i,
     ],
@@ -313,8 +313,8 @@
     // that the strict rateLimitRegexes set fixes), so a stray "resets <time>" in chat
     // is harmless here.
     resetTimeRegexes: [
-      /\bresets?\s+(?:at\s+)?(\d{1,2}:\d{2}\s*[ap]m\b(?:\s*\([^)]+\))?)/i,
-      /limit will reset at\s+(\d{1,2}:\d{2}\s*[ap]m\b(?:\s*\([^)]+\))?)/i,
+      /\bresets?\s+(?:at\s+)?(\d{1,2}(?::\d{2})?\s*[ap]m\b(?:\s*\([^)]+\))?)/i,
+      /limit will reset at\s+(\d{1,2}(?::\d{2})?\s*[ap]m\b(?:\s*\([^)]+\))?)/i,
     ],
   };
 
@@ -1166,6 +1166,20 @@
         if (m) { var p2 = parseResetTime(m[1]); if (p2) { until = p2; break; } }
       }
     }
+    // If the resolved reset time has ALREADY passed (parseResetTime returned a <= now epoch
+    // within the recent-past grace), the limit has reset — do NOT sleep. Mark the on-screen
+    // notice served so detectState stops treating it as a wall, and resume pinging now. This
+    // is what keeps an hour-only "resets 1pm" notice seen just after 1pm from sleeping ~24h
+    // (and, with the parse fix, from the old 5h fallback).
+    if (until && until <= Date.now()) {
+      lsSet(LS.servedRl, rateLimitSignature());
+      lsSet(LS.sleepUntil, '');
+      lsSet(LS.pendingRlSig, '');
+      lastPingAt = 0; // resume immediately
+      nslog('resume', { reason: 'reset-already-passed' });
+      log('rate-limit reset already passed — resuming instead of sleeping');
+      return;
+    }
     if (!until) until = Date.now() + CFG.rateLimitFallbackMs;
     // Accumulate slept time so maxRuntime ignores it.
     var slept = lsNum(LS.sleptAccum, 0) + Math.max(0, until - Date.now());
@@ -1177,26 +1191,59 @@
     log('rate limited — sleeping until', new Date(until).toISOString());
   }
 
-  // Parse a human reset time like "10:10pm (Asia/Jerusalem)" / "3:30 PM" / "15:30"
-  // into a future timestamp. If an IANA "(Zone)" is present we resolve the time IN
-  // that zone — correct worldwide, even when the user's OS clock is in a different
-  // timezone than the one Claude reports. Without a zone we read it as local time.
+  // A clock-time reset seen up to this long in the PAST means the limit has already reset
+  // (so resume), not that the next reset is ~24h away. Comfortably larger than a session
+  // window yet well below the ~20h+ gap that a genuine midnight-crossing reset shows, so the
+  // two cases never collide.
+  var RESET_PASSED_GRACE_MS = 8 * 3600 * 1000;
+
+  // Parse a human reset time like "10:10pm (Asia/Jerusalem)" / "1pm" / "3:30 PM" / "15:30"
+  // into an epoch. Returns a FUTURE epoch to sleep until, OR a recent-PAST epoch (<= now) to
+  // signal the reset has ALREADY happened (enterSleep then resumes instead of rolling ~24h to
+  // "tomorrow"). Minutes are optional ("1pm"), which is what the real notice often shows — the
+  // old `\d{1,2}:\d{2}` requirement failed to parse it and fell back to a 5h sleep. With an
+  // IANA "(Zone)" we resolve in that zone (correct even when the OS clock is elsewhere); else
+  // local time.
   function parseResetTime(str) {
     if (!str) return 0;
     var s = String(str);
-    var m = s.match(/(\d{1,2}):(\d{2})\s*(am|pm)?/i);
+    var m = s.match(/(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i); // minutes optional: "1pm" and "1:00pm"
     if (!m) return 0;
-    var h = +m[1], min = +m[2];
+    var h = +m[1], min = m[2] ? +m[2] : 0;
     if (m[3]) { var pm = /pm/i.test(m[3]); if (pm && h < 12) h += 12; if (!pm && h === 12) h = 0; }
 
     var tz = null;
     var tzm = s.match(/\(([A-Za-z]+(?:\/[A-Za-z0-9_+\-]+)+)\)/); // e.g. (Asia/Jerusalem)
     if (tzm && isValidTimeZone(tzm[1])) tz = tzm[1];
 
-    var until = tz ? nextTimeInZone(h, min, tz) : nextLocalTime(h, min);
-    if (!until) return 0;
-    // jitter 30–120s so we don't all wake at the exact reset instant.
-    return until + (30000 + Math.floor(Math.random() * 90000));
+    var now = Date.now();
+    var today = tz ? todayTimeInZone(h, min, tz) : todayTimeLocal(h, min); // today's occurrence (may be past)
+    if (!today) return 0;
+    var until;
+    if (today > now) {
+      until = today; // reset is later today → sleep until it
+    } else if ((now - today) <= RESET_PASSED_GRACE_MS) {
+      until = today; // it just passed → the limit has reset → return a PAST epoch (resume signal)
+    } else {
+      until = tz ? nextTimeInZone(h, min, tz) : nextLocalTime(h, min); // long past → genuine next occurrence (crosses midnight)
+    }
+    // Jitter 30–120s on a FUTURE wake so panels don't all resume at the same instant; never
+    // jitter a past epoch into the future (that would re-introduce a pointless sleep).
+    return until > now ? until + (30000 + Math.floor(Math.random() * 90000)) : until;
+  }
+
+  // Today's occurrence of HH:MM (local / in `tz`), WITHOUT rolling to tomorrow — so the caller
+  // can tell "already passed today" from "still to come".
+  function todayTimeLocal(h, min) {
+    var d = new Date(); d.setHours(h, min, 0, 0); return d.getTime();
+  }
+  function todayTimeInZone(h, min, tz) {
+    var dtf = new Intl.DateTimeFormat('en-US', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' });
+    var p = {}; dtf.formatToParts(new Date(Date.now())).forEach(function (x) { p[x.type] = x.value; });
+    var guess = Date.UTC(+p.year, +p.month - 1, +p.day, h, min, 0);
+    var epoch = guess - zoneOffsetMs(guess, tz);
+    epoch = guess - zoneOffsetMs(epoch, tz); // refine once for DST boundaries
+    return epoch;
   }
 
   function nextLocalTime(h, min) {
@@ -1645,6 +1692,7 @@
     state: detectState,
     popup: detectPopup,
     rateLimit: detectRateLimit,
+    parseResetTime: parseResetTime, // exposed for tests / live tuning of reset-time parsing
     input: getInput,
     config: CFG,
     instance: INSTANCE_ID,

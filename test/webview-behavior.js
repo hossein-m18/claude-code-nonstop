@@ -272,5 +272,47 @@ test('switching conversation (known→known) does NOT migrate state across conve
   assert.strictEqual(h.ls.getItem('nonstop-s-A-enabled'), 'true', 'A keeps its own state');
 });
 
+console.log('\nwebview behaviour — reset-time parsing (hour-only + already-passed resume)');
+
+test('an hour-only "resets 1pm" limit notice is detected and its time captured (was the 5h-fallback bug)', () => {
+  const h = load({ transcriptText: "You've hit your session limit · resets 1pm (Asia/Jerusalem)" });
+  assert.strictEqual(h.debug.state(), 'RATE_LIMITED', 'hour-only notice must still detect as a limit');
+  const rl = h.debug.rateLimit();
+  assert.ok(rl && rl.captured && /1pm/i.test(rl.captured),
+    'the hour-only reset time must now be captured (minutes optional), got ' + (rl && rl.captured));
+});
+
+test('parseResetTime accepts hour-only times like "11pm" (previously returned 0 → 5h fallback)', () => {
+  const h = load({});
+  assert.notStrictEqual(h.debug.parseResetTime('11pm'), 0, '"11pm" must parse');
+  assert.notStrictEqual(h.debug.parseResetTime('1:30pm'), 0, '"1:30pm" still parses');
+  assert.strictEqual(h.debug.parseResetTime('not a time'), 0, 'garbage still returns 0');
+});
+
+// Format a Date as a 12h "h:mmam/pm" string in LOCAL time (matches parseResetTime's no-tz path).
+function fmtLocal(d) {
+  var h = d.getHours(), m = d.getMinutes(), ap = h < 12 ? 'am' : 'pm', h12 = h % 12 || 12;
+  return h12 + ':' + (m < 10 ? '0' : '') + m + ap;
+}
+function nearMidnight() {
+  var n = new Date();
+  return (n.getHours() === 23 && n.getMinutes() > 45) || (n.getHours() === 0 && n.getMinutes() < 15);
+}
+
+test('a reset time in the recent past returns a <= now epoch (resume signal, not a tomorrow sleep)', () => {
+  if (nearMidnight()) return; // the constructed clock would cross days; skip the rare edge
+  const h = load({});
+  const r = h.debug.parseResetTime(fmtLocal(new Date(Date.now() - 10 * 60000)));
+  assert.ok(r > 0 && r <= Date.now(), 'recent-past reset → epoch <= now (already reset), got delta ' + (r - Date.now()));
+});
+
+test('a near-future reset time sleeps only until then (minutes away, not the 5h fallback)', () => {
+  if (nearMidnight()) return;
+  const h = load({});
+  const r = h.debug.parseResetTime(fmtLocal(new Date(Date.now() + 10 * 60000)));
+  assert.ok(r > Date.now() && r < Date.now() + 13 * 60000,
+    'future reset must be ~10min away (+jitter), not hours, got delta ' + (r - Date.now()));
+});
+
 console.log('\n' + (failed === 0 ? 'ALL PASS' : 'FAILURES') + `: ${passed} passed, ${failed} failed\n`);
 process.exit(failed === 0 ? 0 : 1);
