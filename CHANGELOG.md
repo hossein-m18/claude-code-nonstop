@@ -1,5 +1,11 @@
 # Changelog
 
+## \[0.5.0] - 2026-06-15
+
+### Added
+
+* **Nonstop no longer takes the first "done" at face value - it double-checks.** Autonomous agents often declare completion prematurely (e.g. an agent that finished the feature but hadn't run the QA/test pass yet). When Claude emits the completion sentinel, Nonstop now pushes a verification nudge - "before you finish, double-check nothing real is left: tests, edge cases, error handling, docs, pending spec items; reply NONSTOP_DONE only if truly done" - and stops only if Claude still reports done after it. The number of nudges is the new `nonstop.doneConfirmNudges` setting (default 1; 0 restores the old stop-on-first-signal behaviour; also editable in the panel's settings popup as "Re-check before stopping (times)"). Each nudge carries the sentinel so the done-accounting stays balanced and Claude re-signals when it confirms. A useful side effect: this also softens false "done" detection - a stray sentinel now triggers a harmless verification nudge instead of ending the shift.
+
 ## \[0.4.6] - 2026-06-15
 
 ### Changed

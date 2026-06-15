@@ -43,6 +43,7 @@ function buildSeedConfig(version) {
     doneStallPings: c.get('doneStallPings', 3),
     maxStallRetries: c.get('maxStallRetries', 4),
     sentinelDoneDetection: c.get('sentinelDoneDetection', true),
+    doneConfirmNudges: c.get('doneConfirmNudges', 1),
     rateLimitFallbackMs: c.get('rateLimitFallbackMs', 18000000),
     userActivityPauseMs: c.get('userActivityPauseMs', 120000),
     debug: c.get('debug', false),

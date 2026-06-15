@@ -2,7 +2,7 @@
   "name": "claude-code-nonstop",
   "displayName": "Claude Code Nonstop",
   "description": "Keep Claude Code going across usage limits — a panel toggle that pings Claude to continue and, when you hit a rate limit, waits it out and resumes automatically when the window reopens.",
-  "version": "0.4.6",
+  "version": "0.5.0",
   "publisher": "OrBenozio",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -162,6 +162,13 @@
           "type": "boolean",
           "default": true,
           "description": "Append a sentinel instruction to pings so Claude signals completion reliably."
+        },
+        "nonstop.doneConfirmNudges": {
+          "type": "number",
+          "default": 1,
+          "minimum": 0,
+          "maximum": 5,
+          "description": "When Claude signals completion, push this many verification nudges (\"are you really done? check tests/edge cases/docs\") before stopping the shift. Guards against an autonomous agent quitting prematurely. 0 = stop immediately on the first completion signal."
         },
         "nonstop.rateLimitFallbackMs": {
           "type": "number",

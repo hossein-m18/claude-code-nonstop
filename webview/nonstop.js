@@ -32,6 +32,11 @@
     // overnight failure to resume doesn't kill the shift. A real completion sentinel still
     // stops immediately. 0 = give up as soon as the stall threshold is hit (old behaviour).
     maxStallRetries: 4,
+    // When Claude signals completion (the sentinel), don't stop on the first one — push this
+    // many verification nudges ("are you really done? check tests/edges/docs") first, and stop
+    // only if it still reports done. Guards against an autonomous agent quitting prematurely.
+    // 0 = stop immediately on the first completion signal (the pre-0.5 behaviour).
+    doneConfirmNudges: 1,
     sentinelDoneDetection: true,
     rateLimitFallbackMs: 18000000,
     userActivityPauseMs: 120000,
@@ -812,6 +817,8 @@
   var sendStartedAt = 0;
   var SEND_RETRY_MS = 100;
   var SEND_MAX_TRIES = 8; // ~800ms total: long enough for a React flush, short enough to re-ping
+  var currentSendKind = null; // 'done-check' for a verification nudge, else a normal ping (only one send is ever in flight, so a single var is unambiguous)
+  var doneNudges = 0;         // verification nudges already sent after a completion signal this shift
 
   // Record a confirmed ping (the send button was actually clicked). Centralised so the
   // synchronous click (button already live) and the deferred retry click account identically.
@@ -821,7 +828,12 @@
     if (text.indexOf(CFG.doneSentinel) !== -1) sentinelPings++;
     lsSet(LS.pingCount, lsNum(LS.pingCount, 0) + 1);
     lastPingSig = outputSignature(); // capture right after the send, for stall detection
-    nslog('ping', { n: lsNum(LS.pingCount, 0), retry: stallRetries || undefined });
+    if (currentSendKind === 'done-check') {
+      doneNudges++;
+      nslog('done-nudge', { n: doneNudges, of: liveCfg('doneConfirmNudges') });
+    } else {
+      nslog('ping', { n: lsNum(LS.pingCount, 0), retry: stallRetries || undefined });
+    }
     log('pinged:', text.slice(0, 40));
   }
 
@@ -847,11 +859,13 @@
     lastInsertedText = '';
     lsSet(LS.lastPing, '');
     sendPending = false;
+    currentSendKind = null; // send failed → not counted as a nudge/ping
     weAreTyping = false;
     log('send aborted: send button never became clickable');
   }
 
-  function setInputAndSend(text) {
+  function setInputAndSend(text, kind) {
+    currentSendKind = kind || null; // remembered for recordSentPing (single in-flight send)
     var input = getInput();
     if (!input) { log('no input box found'); return; }
     // Re-check RIGHT before we clear — closes the time-of-check/time-of-use race where
@@ -912,6 +926,15 @@
     return txt;
   }
 
+  // The verification nudge sent after a completion signal (see the done branch in tick). It
+  // MUST contain the sentinel so (a) it counts as one of our own pings — keeping the
+  // done-accounting balanced — and (b) Claude re-signals when it confirms it is truly done.
+  function buildDoneCheckText() {
+    return 'Before you finish: double-check nothing real is left - tests, edge cases, error ' +
+      'handling, docs, and any pending items in the task/spec. If you are genuinely done, reply ' +
+      CFG.doneSentinel + '. Otherwise keep going.';
+  }
+
   // ── Shift lifecycle ──────────────────────────────────────────────────────────
   function startShift() {
     lsSet(LS.enabled, 'true');
@@ -925,7 +948,7 @@
     lsSet(LS.servedRl, '');
     // Reset in-memory ping/stall state for a fresh shift.
     stallCount = 0; stallRetries = 0; lastPingSig = null; lastPingAt = 0; lastSendAt = 0; lastGrowthAt = 0;
-    baseSentinel = sentinelCount(); sentinelPings = 0;
+    baseSentinel = sentinelCount(); sentinelPings = 0; doneNudges = 0;
     nslog('start', { interval: Math.round(liveCfg('pingIntervalMs') / 1000) + 's' });
     log('shift started; owner', INSTANCE_ID);
     updateButton();
@@ -1070,7 +1093,16 @@
     }
     if (state === 'WORKING') { stallCount = 0; stallRetries = 0; return; }
 
-    if (state === 'DONE' || sawDoneSentinel()) { stopShift('done-sentinel'); return; }
+    if (state === 'DONE' || sawDoneSentinel()) {
+      // Don't accept the first "done" at face value — autonomous agents often declare
+      // completion prematurely. Push up to doneConfirmNudges verification nudges and stop only
+      // if it STILL reports done after them. Each nudge carries the sentinel, so it rebalances
+      // the done-accounting (sawDoneSentinel goes false until Claude re-confirms); maybePing's
+      // own guards + sendPending stop it from double-firing before Claude responds.
+      if (doneNudges >= liveCfg('doneConfirmNudges')) { stopShift('done-sentinel'); return; }
+      maybePing(buildDoneCheckText(), 'done-check');
+      return;
+    }
 
     if (state === 'WAITING_PERMISSION') { handlePermission(); return; }
     if (state === 'WAITING_DECISION') { handleDecision(); return; }
@@ -1135,7 +1167,7 @@
     }
   }
 
-  function maybePing(text) {
+  function maybePing(text, kind) {
     if (userRecentlyActive()) { log('paused: user active'); return false; }
     if (inQuietHours()) { log('paused: quiet hours'); return false; }
     if (inputIsForeign()) { log('paused: user draft in input'); return false; }
@@ -1145,7 +1177,8 @@
     // setInputAndSend types the text and submits it (synchronously if the button is already
     // live, else via a short deferred retry). The ping is counted in recordSentPing once the
     // click actually lands — not here — so a never-clickable button never inflates the count.
-    setInputAndSend(text);
+    // `kind` ('done-check' vs a normal ping) is remembered there for the right accounting.
+    setInputAndSend(text, kind);
     return false;
   }
 
@@ -1409,6 +1442,12 @@
     mrWrap.appendChild(mrHint); mrWrap.appendChild(mr); // "= 8h" sits to the LEFT of the input
     row('Stop after (minutes, 0=off)', mrWrap);
 
+    var dcn = mkInput('number', liveCfg('doneConfirmNudges'));
+    dcn.min = 0; dcn.max = 5;
+    dcn.title = 'When Claude says it is done, push this many "are you really done? (tests, edge cases, docs)" nudges before stopping — guards against quitting too early. 0 = stop on the first done signal.';
+    dcn.onchange = function () { setOverride('doneConfirmNudges', Math.max(0, parseInt(dcn.value, 10) || 0)); };
+    row('Re-check before stopping (times)', dcn);
+
     // Divider: everything below is about how Nonstop handles Claude's interaction popups
     // (permission + decision), as opposed to the general ping/stop settings above.
     var popupDivider = document.createElement('div');
@@ -1448,7 +1487,7 @@
       'color:var(--vscode-charts-green,#4ec9b0);opacity:0;transition:opacity .15s;';
     resetMsg.textContent = '✓ Reset to defaults';
     reset.onclick = function () {
-      ['pingIntervalMs', 'pingText', 'quietHours', 'maxPings', 'maxRuntimeMs',
+      ['pingIntervalMs', 'pingText', 'quietHours', 'maxPings', 'maxRuntimeMs', 'doneConfirmNudges',
         'onPermission', 'permissionGraceMs', 'onDecision'].forEach(function (k) { setOverride(k, null); });
       // Refresh the visible fields to the restored defaults rather than closing — the reset
       // is then visible and immediately re-editable, no destructive close-and-reopen.
@@ -1457,6 +1496,7 @@
       quiet.value = liveCfg('quietHours') || '';
       mp.value = liveCfg('maxPings');
       mr.value = Math.round(liveCfg('maxRuntimeMs') / 60000); updMrHint();
+      dcn.value = liveCfg('doneConfirmNudges');
       perm.value = liveCfg('onPermission');
       grace.value = Math.round(liveCfg('permissionGraceMs') / 1000);
       dec.value = liveCfg('onDecision');

@@ -314,5 +314,38 @@ test('a near-future reset time sleeps only until then (minutes away, not the 5h 
     'future reset must be ~10min away (+jitter), not hours, got delta ' + (r - Date.now()));
 });
 
+console.log('\nwebview behaviour — done-confirm nudges (push before stopping)');
+
+test('doneConfirmNudges=1: a completion signal first gets a verification nudge, then stops on re-confirm', () => {
+  const store = new Map();
+  store.set('nonstop-enabled', 'true');
+  store.set('nonstop-session-start', String(Date.now()));
+  const h = load({
+    store, input: true, withSendButton: true, inputText: '',
+    config: { doneConfirmNudges: 1, sentinelDoneDetection: true, doneStallPings: 1, pingIntervalMs: 1000 },
+    transcriptText: 'still working, no sentinel yet',
+  });
+  const base = Date.now(), realNow = Date.now;
+  try {
+    // Tick 1: a normal ping fires (so sentinelPings>0 — the baseline the done-accounting needs).
+    Date.now = () => base; h.pump();
+    const sends1 = h.sendClicks();
+    assert.ok(sends1 >= 1, 'a normal ping fired first, got ' + sends1);
+    // Claude replies "done" (sentinels appear → transcript grows → WORKING first).
+    h.setTranscript('All done. NONSTOP_DONE NONSTOP_DONE NONSTOP_DONE');
+    Date.now = () => base + 100000; h.inputEl.textContent = ''; h.pump();
+    assert.strictEqual(h.ls.getItem('nonstop-enabled'), 'true', 'still streaming on the growth tick');
+    // Streaming settles (>2s) → done detected. With one nudge budgeted it must NUDGE, not stop.
+    Date.now = () => base + 103000; h.inputEl.textContent = ''; h.pump();
+    assert.strictEqual(h.ls.getItem('nonstop-enabled'), 'true', 'first completion → verification nudge, NOT a stop');
+    assert.ok(h.sendClicks() > sends1, 'a verification nudge was actually sent');
+    // Still reports done after the nudge → now it stops.
+    Date.now = () => base + 106000; h.inputEl.textContent = ''; h.pump();
+    assert.strictEqual(h.ls.getItem('nonstop-enabled'), 'false', 'still done after the nudge → stop');
+    assert.ok(/done-sentinel/.test(h.ls.getItem('nonstop-last-stop') || ''),
+      'reason done-sentinel, got ' + h.ls.getItem('nonstop-last-stop'));
+  } finally { Date.now = realNow; }
+});
+
 console.log('\n' + (failed === 0 ? 'ALL PASS' : 'FAILURES') + `: ${passed} passed, ${failed} failed\n`);
 process.exit(failed === 0 ? 0 : 1);

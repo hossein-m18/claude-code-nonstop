@@ -270,11 +270,13 @@ test('maxRuntime backstop overrides stall-retries (stops mid-retry on runtime)',
 test('a done sentinel stops immediately, even with retries remaining', () => {
   // After a ping, Claude actually replies with the completion sentinel. Once streaming
   // settles (>2s of no growth), sawDoneSentinel must stop the shift on the next tick — the
-  // stall-retry budget must NOT keep an actually-finished shift alive.
+  // stall-retry budget must NOT keep an actually-finished shift alive. doneConfirmNudges:0
+  // keeps the legacy "stop on the first done signal" behaviour for this assertion (the
+  // default is now 1, which would push a verification nudge first — covered separately).
   const store = new Map();
   const h = load({
     store, input: true, withSendButton: true, inputText: '',
-    config: { maxStallRetries: 10, pingIntervalMs: 15000, doneStallPings: 1, sentinelDoneDetection: true },
+    config: { maxStallRetries: 10, pingIntervalMs: 15000, doneStallPings: 1, sentinelDoneDetection: true, doneConfirmNudges: 0 },
     transcriptText: 'working',
   });
   h.debug.simulateRateLimit(1);
