@@ -1,5 +1,11 @@
 # Changelog
 
+## \[0.4.6] - 2026-06-15
+
+### Changed
+
+* **`__nonstopDebug.status()` now reports the EFFECTIVE state, matching what the loop actually does.** It recomputed `detectState()` without the "already-served limit" flag that `tick()` passes, so a window that had waited out a limit and was actively resuming still showed `state: RATE_LIMITED` - alarming, but only a readout artifact. `status()` now applies the served-limit flag (so it shows `WAITING_CONTINUE` while resuming), and adds `rawState` (the unflagged detector view) and `rateLimitServed` (true when a limit notice is on screen but already waited out) for debugging.
+
 ## \[0.4.5] - 2026-06-15
 
 ### Fixed

@@ -1710,15 +1710,22 @@
     // Live shift status — the one-stop diagnostic ("why did it stop? is it sleeping?").
     status: function () {
       var s = lsNum(LS.sleepUntil, 0);
+      // Mirror what tick() actually does: if the on-screen limit notice is one we've already
+      // served, the loop ignores it (resumes) — so report the EFFECTIVE state with that flag,
+      // not a raw detectState() that would alarm with RATE_LIMITED while we're really resuming.
+      var rlSig = rateLimitSignature();
+      var alreadyServed = !!rlSig && rlSig === lsGet(LS.servedRl, '');
       return {
         enabled: isEnabled(),
         owner: isOwner(),
-        state: detectState(),
+        state: detectState(alreadyServed),
+        rawState: detectState(),          // unflagged view, for debugging the detector itself
+        rateLimitServed: alreadyServed,   // true = a limit notice is showing but already waited out
         popup: detectPopup(),
         looksRateLimited: looksRateLimited(),
         pings: lsNum(LS.pingCount, 0),
         sleepingUntil: s ? new Date(s).toISOString() : null,
-        rlSignature: rateLimitSignature() || null,
+        rlSignature: rlSig || null,
         servedRl: lsGet(LS.servedRl, '') || null,   // limit already waited out (won't re-sleep)
         pendingRl: lsGet(LS.pendingRlSig, '') || null, // limit currently being slept out
         lastStop: lsGet(LS.lastStop, '(none)'),
