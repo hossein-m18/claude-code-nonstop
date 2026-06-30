@@ -665,13 +665,12 @@
     // Layer 3: DOM reflection.
     if (matchAny(SIGNALS.workingHints)) return 'WORKING';
 
-    // Layer 4: heuristic — input present and holding nothing foreign (empty, or only our own
-    // stranded ping) = ready to (re)ping. Treating our own stuck ping as WAITING_CONTINUE is
-    // what actually lets a reloaded panel clear and resend it: LS.lastPing makes the
-    // not-foreign check survive the reload, and setInputAndSend re-guards inputIsForeign right
-    // before it clears, so a genuine user draft is still never touched.
+    // Layer 4: heuristic — input present = ready to (re)ping.
+    // If the input is empty or holds our own stranded ping, we clear it and send the ping text.
+    // If the input holds foreign text (a genuine user draft), we send that draft instead,
+    // as long as the user hasn't been active recently (protects drafts mid-typing).
     var input = getInput();
-    if (input && !inputIsForeign()) return 'WAITING_CONTINUE';
+    if (input) return 'WAITING_CONTINUE';
     return 'UNKNOWN';
   }
 
@@ -864,13 +863,13 @@
     log('send aborted: send button never became clickable');
   }
 
-  function setInputAndSend(text, kind) {
+  function setInputAndSend(text, kind, isUserDraft) {
     currentSendKind = kind || null; // remembered for recordSentPing (single in-flight send)
     var input = getInput();
     if (!input) { log('no input box found'); return; }
     // Re-check RIGHT before we clear — closes the time-of-check/time-of-use race where
     // the user starts typing between maybePing()'s guard and this wipe.
-    if (inputIsForeign()) { log('abort send: user draft in input'); return; }
+    if (!isUserDraft && inputIsForeign()) { log('abort send: user draft in input'); return; }
     // Never type+click while the send control is acting as Stop — that interrupts Claude's
     // in-flight tool/turn and leaves the ping text stranded in the box. Re-checked here (not
     // only in tick) to close the race where Claude starts working between tick()'s decision
@@ -878,6 +877,15 @@
     if (sendButtonIsStop()) { log('abort send: Claude busy (send button is Stop)'); return; }
     weAreTyping = true;
     input.focus();
+    
+    if (isUserDraft) {
+      lastInsertedText = text;
+      lsSet(LS.lastPing, text);
+      notifyReactInput(input);
+      attemptSend(text, 0);
+      return;
+    }
+
     // Clear any leftover (e.g. a previous failed send that became a newline, or our own
     // stuck ping). Safe now: a foreign user draft was rejected just above.
     try { document.execCommand('selectAll', false, null); document.execCommand('delete', false, null); } catch (e) {}
@@ -1170,7 +1178,14 @@
   function maybePing(text, kind) {
     if (userRecentlyActive()) { log('paused: user active'); return false; }
     if (inQuietHours()) { log('paused: quiet hours'); return false; }
-    if (inputIsForeign()) { log('paused: user draft in input'); return false; }
+    
+    var isUserDraft = false;
+    if (inputIsForeign()) {
+      text = inputText();
+      isUserDraft = true;
+      log('sending user draft instead of config text:', text.slice(0, 40));
+    }
+    
     if (sendPending && (Date.now() - sendStartedAt) < 4000) return false; // a send is mid-flight
     if ((Date.now() - lastSendAt) < 3000) return false; // anti double-fire
 
@@ -1178,7 +1193,7 @@
     // live, else via a short deferred retry). The ping is counted in recordSentPing once the
     // click actually lands — not here — so a never-clickable button never inflates the count.
     // `kind` ('done-check' vs a normal ping) is remembered there for the right accounting.
-    setInputAndSend(text, kind);
+    setInputAndSend(text, kind, isUserDraft);
     return false;
   }
 

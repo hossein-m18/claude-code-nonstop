@@ -178,10 +178,9 @@ test('the stranded ping is actually cleared and resent (end-to-end resume after 
     'a resend must fire for our own stuck ping after reload — the persistence fix + routing close the loop');
 });
 
-test('a FOREIGN user draft in the box is still UNKNOWN and never resent/cleared', () => {
-  // The flip side: the routing must not touch a real user draft. A foreign string in the box
-  // (not equal to LS.lastPing) must stay UNKNOWN, and setInputAndSend's pre-clear guard means
-  // no send fires — the v0.2.6 draft-protection invariant must hold under the new routing.
+test('a FOREIGN user draft in the box routes to WAITING_CONTINUE and is sent instead of the pingText', () => {
+  // A foreign string in the box (not equal to LS.lastPing) now routes to WAITING_CONTINUE
+  // so that the extension sends the user's drafted message when the interval elapses.
   const store = new Map();
   store.set('nonstop-enabled', 'true');
   store.set('nonstop-session-start', String(Date.now()));
@@ -193,8 +192,9 @@ test('a FOREIGN user draft in the box is still UNKNOWN and never resent/cleared'
   });
   const before = h.sendClicks();
   for (let i = 0; i < 4; i++) h.pump();
-  assert.strictEqual(h.debug.state(), 'UNKNOWN', 'a foreign draft must NOT route to WAITING_CONTINUE');
-  assert.strictEqual(h.sendClicks() - before, 0, 'a foreign user draft is never cleared or sent');
+  assert.strictEqual(h.debug.state(), 'WAITING_CONTINUE', 'a foreign draft routes to WAITING_CONTINUE');
+  assert.ok(h.sendClicks() - before > 0, 'a foreign user draft is sent');
+  assert.strictEqual(h.ls.getItem('nonstop-last-ping'), 'wait, let me ask something else entirely', 'the foreign draft becomes the registered last ping');
 });
 
 // ── 4. stall-retry / backoff budget ─────────────────────────────────────────────
