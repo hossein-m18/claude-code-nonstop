@@ -775,7 +775,7 @@
   // as a foreign user draft — blocked forever (never cleared, never resent). So we fall
   // back to the persisted copy (LS.lastPing) to still recognise our own stuck ping.
   function inputIsForeign() {
-    var t = inputText();
+    var t = inputText().trim();
     if (t === '') return false;
     var mine = (lastInsertedText || lsGet(LS.lastPing, '') || '').trim();
     return t !== mine;
