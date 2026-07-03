@@ -194,7 +194,7 @@ test('a FOREIGN user draft in the box routes to WAITING_CONTINUE and is sent ins
   for (let i = 0; i < 4; i++) h.pump();
   assert.strictEqual(h.debug.state(), 'WAITING_CONTINUE', 'a foreign draft routes to WAITING_CONTINUE');
   assert.ok(h.sendClicks() - before > 0, 'a foreign user draft is sent');
-  assert.strictEqual(h.ls.getItem('nonstop-last-ping'), 'wait, let me ask something else entirely', 'the foreign draft becomes the registered last ping');
+  assert.strictEqual(h.ls.getItem('nonstop-last-ping'), 'continue - reply NONSTOP_DONE when fully done', 'the foreign draft does NOT become the registered last ping');
 });
 
 // ── 4. stall-retry / backoff budget ─────────────────────────────────────────────

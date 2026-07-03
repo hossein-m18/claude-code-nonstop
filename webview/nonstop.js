@@ -836,10 +836,7 @@
     log('pinged:', text.slice(0, 40));
   }
 
-  // Click the send button if it's live; otherwise retry on short timers (the React state
-  // flush that enables it is async). On give-up, clear our typed text so nothing is stranded
-  // and a later tick retries from a clean state.
-  function attemptSend(text, tryNum) {
+  function attemptSend(text, tryNum, isUserDraft) {
     if (tryNum === 0) { sendPending = true; sendStartedAt = Date.now(); }
     var btn = findSendButton();
     if (btn) {
@@ -849,18 +846,36 @@
       setTimeout(function () { weAreTyping = false; }, 250);
       return;
     }
+    
     if (tryNum < SEND_MAX_TRIES) {
-      setTimeout(function () { attemptSend(text, tryNum + 1); }, SEND_RETRY_MS);
+      setTimeout(function() { attemptSend(text, tryNum + 1, isUserDraft); }, SEND_RETRY_MS);
       return;
     }
-    try { document.execCommand('selectAll', false, null); document.execCommand('delete', false, null); } catch (e) {}
-    notifyReactInput(getInput()); // keep React state in sync with the now-empty box
-    lastInsertedText = '';
-    lsSet(LS.lastPing, '');
+    
+    // give up
     sendPending = false;
     currentSendKind = null; // send failed → not counted as a nudge/ping
     weAreTyping = false;
     log('send aborted: send button never became clickable');
+    
+    if (isUserDraft) {
+      // Never wipe a user draft just because we failed to send it!
+      return;
+    }
+
+    var currentBox = inputText();
+    if (currentBox === text) {
+      // It's stuck. Let's clear it.
+      try {
+        var el = getInput();
+        if (el) {
+          el.focus();
+          document.execCommand('selectAll', false, null);
+          document.execCommand('delete', false, null);
+          notifyReactInput(el);
+        }
+      } catch (e) {}
+    }
   }
 
   function setInputAndSend(text, kind, isUserDraft) {
@@ -879,10 +894,7 @@
     input.focus();
     
     if (isUserDraft) {
-      lastInsertedText = text;
-      lsSet(LS.lastPing, text);
-      notifyReactInput(input);
-      attemptSend(text, 0);
+      attemptSend(text, 0, true);
       return;
     }
 
