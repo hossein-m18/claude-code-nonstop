@@ -24,3 +24,4 @@ node_modules/
 
 # Bundled usage-core binaries — added at package time, not committed to git
 bin/usage-core-*
+temp_old_nonstop.js
